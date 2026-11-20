@@ -1,0 +1,28 @@
+# Environment variables & secrets
+.env
+.env.local
+
+# SQLite Databases & Backups
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+shop.db
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+.venv*/
+env/
+venv/
+
+# Logs
+*.log
+logs/
+
+# Operating System files
+.DS_Store
+Thumbs.db
