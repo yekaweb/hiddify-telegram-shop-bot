@@ -3,13 +3,17 @@ import sys
 import time
 import uuid
 import logging
+import threading
 from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 import telebot
 from telebot import types
 
 import config
 import database as db
 from hiddify_api import HiddifyClient, extract_uuid_from_text, format_subscription_report, gregorian_to_jalali
+from payment_gateways import ZarinPalClient, ZibalClient
 import keyboards as kb
 
 logging.basicConfig(
@@ -240,6 +244,12 @@ def handle_text_menu(message):
         return
     elif state.get("action") == "ADMIN_EXT_RES_DAYS":
         process_admin_ext_res_days(message)
+        return
+    elif state.get("action") == "ADMIN_SET_ZARINPAL":
+        process_admin_set_zarinpal(message)
+        return
+    elif state.get("action") == "ADMIN_SET_ZIBAL":
+        process_admin_set_zibal(message)
         return
 
     # Standard Menu Buttons
@@ -618,18 +628,304 @@ def handle_ask_receipt(call):
     bot.send_message(user_id, "📸 لطفاً <b>عکس واضح فیش واریزی</b> را همین‌جا ارسال کنید:")
     bot.answer_callback_query(call.id)
 
+def fulfill_order(order_id: str, payment_ref_id: str = None):
+    """Provisions Hiddify account, updates database, credits referral, and delivers message to user."""
+    order = db.get_order(order_id)
+    if not order:
+        return False, "سفارش یافت نشد", False
+
+    if order["status"] == "completed":
+        return True, order.get("hiddify_uuid"), False
+
+    is_renewal = str(order.get("plan_name", "")).startswith("تمدید") or (order.get("custom_name") and str(order.get("custom_name")).startswith("renew:"))
+    target_uuid = order.get("hiddify_uuid")
+    if not target_uuid and order.get("custom_name") and str(order.get("custom_name")).startswith("renew:"):
+        target_uuid = str(order.get("custom_name")).replace("renew:", "").strip()
+
+    if is_renewal and target_uuid:
+        ok, result = hiddify.add_traffic_and_days(target_uuid, add_gb=order["traffic_gb"], add_days=order["days"])
+        if not ok:
+            bot.send_message(config.ADMIN_ID, f"❌ خطا در تمدید کاربر در هیدیفای:\n{result}")
+            return False, str(result), is_renewal
+        user_uuid = target_uuid
+        client_name = order.get("custom_name") or "اشتراک تمدید شده"
+        sub_url = hiddify.get_sub_url(user_uuid)
+    else:
+        client_name = order.get("custom_name") or f"df-{order['tg_id'] % 10000}-{int(time.time()) % 1000}"
+        ok, result = hiddify.create_user(
+            name=client_name,
+            usage_limit_gb=order["traffic_gb"],
+            package_days=order["days"],
+            telegram_id=order["tg_id"],
+            comment=f"Order {order_id}" + (f" - Ref: {payment_ref_id}" if payment_ref_id else "")
+        )
+        if not ok:
+            bot.send_message(config.ADMIN_ID, f"❌ خطا در صدور کاربر در هیدیفای:\n{result}")
+            return False, str(result), is_renewal
+        user_uuid = result.get("uuid")
+        sub_url = result.get("sub_url")
+
+    db.complete_paid_order(order_id, ref_id=payment_ref_id or "Direct", hiddify_uuid=user_uuid)
+    db.add_user_subscription(order["tg_id"], user_uuid, client_name, order["traffic_gb"], order["days"])
+
+    # Process 10% referral reward for the inviter
+    buyer = db.get_user(order["tg_id"])
+    if buyer and buyer.get("invited_by"):
+        inviter_id = buyer["invited_by"]
+        reward = int(order["final_price"] * 0.10)
+        if reward > 0:
+            db.add_wallet_balance(inviter_id, reward)
+            db.record_referral_reward(inviter_id, order["tg_id"], order_id, order["final_price"], reward)
+            inviter = db.get_user(inviter_id)
+            new_balance = inviter["wallet_balance"] if inviter else reward
+            try:
+                bot.send_message(
+                    inviter_id,
+                    f"🎁 <b>پاداش دعوت جدید واریز شد!</b>\n"
+                    f"➖➖➖➖➖➖➖➖➖➖\n"
+                    f"یکی از دوستان دعوت‌شده شما اشتراک خریداری کرد و <b>۱۰٪ از مبلغ سفارش</b> به کیف پول شما اضافه شد:\n\n"
+                    f"💰 <b>مبلغ پاداش:</b> <code>+{reward:,} تومان</code>\n"
+                    f"💳 <b>موجودی جدید کیف پول:</b> <code>{new_balance:,} تومان</code>\n\n"
+                    f"💡 <i>می‌توانید از این موجودی برای خرید اشتراک‌های پرسرعت دلتا فورس نت استفاده کنید.</i>"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to notify inviter {inviter_id}: {e}")
+
+    send_sticker(order["tg_id"], "SUCCESS")
+
+    ref_text = f"\n🔢 <b>کد رهگیری بانکی:</b> <code>{payment_ref_id}</code>" if payment_ref_id else ""
+    delivery_msg = (
+        "🎉 <b>تبریک! پرداخت شما تایید و اشتراک تمدید شد</b>\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        f"📦 <b>پلن:</b> {order['plan_name']}\n"
+        f"📊 <b>حجم افزوده شده:</b> {order['traffic_gb']} گیگابایت\n"
+        f"⏳ <b>اعتبار افزوده شده:</b> {order['days']} روز"
+        f"{ref_text}\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        f"🔗 <b>لینک هوشمند سابسکریپشن شما:</b>\n"
+        f"<code>{sub_url}</code>\n\n"
+        "💡 <i>حجم و زمان به اشتراک قبلی شما اضافه شد و نیازی به تغییر یا تعویض کانفیگ ندارید.</i>"
+    ) if is_renewal else (
+        "🎉 <b>تبریک! پرداخت آنلاین شما تایید و اشتراک صادر شد</b>\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        f"📦 <b>پلن:</b> {order['plan_name']}\n"
+        f"📊 <b>حجم:</b> {order['traffic_gb']} گیگابایت\n"
+        f"⏳ <b>اعتبار:</b> {order['days']} روز"
+        f"{ref_text}\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        f"🔗 <b>لینک هوشمند سابسکریپشن شما:</b>\n"
+        f"<code>{sub_url}</code>\n\n"
+        "💡 <b>نحوه اتصال:</b>\n"
+        "کافیست لینک بالا را کپی کرده و در برنامه متناسب با سیستم‌عامل خود (V2rayNG, Streisand, v2rayN, Hiddify) در بخش Import از کلیپ‌بورد وارد نمایید."
+    )
+    markup = kb.sub_details_keyboard(sub_url, user_uuid=user_uuid)
+    try:
+        bot.send_message(order["tg_id"], delivery_msg, reply_markup=markup)
+    except Exception as e:
+        logger.error(f"Failed to deliver to user {order['tg_id']}: {e}")
+
+    # Notify admin
+    try:
+        bot.send_message(
+            config.ADMIN_ID,
+            f"💰 <b>پرداخت موفق و صدور آنی!</b>\n"
+            f"سفارش: <code>{order_id}</code>\n"
+            f"مبلغ: <code>{order['final_price']:,} تومان</code>\n"
+            f"روش پرداخت: <b>{order.get('payment_method', 'online')}</b>\n"
+            f"کد پیگیری: <code>{payment_ref_id or '—'}</code>\n"
+            f"کاربر: <code>{order['tg_id']}</code>"
+        )
+    except Exception:
+        pass
+
+    return True, user_uuid, is_renewal
+
+def get_gateway_callback_domain():
+    """Retrieve external domain or IP for payment gateway redirection."""
+    configured = db.get_setting("gateway_callback_domain", "")
+    if configured:
+        return configured
+    if config.HIDDIFY_SUB_BASE and "://" in config.HIDDIFY_SUB_BASE:
+        parts = config.HIDDIFY_SUB_BASE.split("://")[1].split("/")[0]
+        if parts:
+            return parts
+    return "127.0.0.1"
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_online_"))
 def handle_pay_online(call):
     user_id = call.from_user.id
     order_id = call.data.replace("pay_online_", "")
+    order = db.get_order(order_id)
+    if not order:
+        bot.answer_callback_query(call.id, "سفارش یافت نشد!")
+        return
+
+    zp_merchant = db.get_setting("zarinpal_merchant", config.ZARINPAL_MERCHANT)
+    zb_merchant = db.get_setting("zibal_merchant", config.ZIBAL_MERCHANT)
+
+    zp_on = db.get_setting("zarinpal_active", "1" if zp_merchant else "0") == "1"
+    zb_on = db.get_setting("zibal_active", "1" if zb_merchant else "0") == "1"
+
+    if not zp_on and not zb_on:
+        zp_on = True
+        zb_on = True
+
     text = (
-        "🌐 <b>درگاه‌های پرداخت آنلاین ریالی</b>\n\n"
-        "یکی از درگاه‌های مورد نظر را انتخاب کنید:\n"
-        "<i>(به زودی پس از اتصال مرچنت‌ها فعال خواهند شد)</i>"
+        "🌐 <b>درگاه‌های پرداخت آنلاین ریالی (شبکه شاپرک)</b>\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        f"💵 <b>مبلغ قابل پرداخت:</b> <code>{order['final_price']:,}</code> تومان\n"
+        f"📦 <b>پلن انتخابی:</b> {order['plan_name']}\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        "لطفاً درگاه بانکی مورد نظر خود را جهت اتصال انتخاب فرمایید:"
     )
-    markup = kb.gateways_keyboard(order_id)
+    markup = kb.gateways_keyboard(order_id, zarinpal_on=zp_on, zibal_on=zb_on)
     bot.edit_message_text(text, user_id, call.message.message_id, reply_markup=markup)
     bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("gw_zarinpal_"))
+def handle_gw_zarinpal(call):
+    user_id = call.from_user.id
+    order_id = call.data.replace("gw_zarinpal_", "")
+    order = db.get_order(order_id)
+    if not order:
+        bot.answer_callback_query(call.id, "سفارش یافت نشد!")
+        return
+
+    merchant = db.get_setting("zarinpal_merchant", config.ZARINPAL_MERCHANT)
+    sandbox = db.get_setting("zarinpal_sandbox", "1" if config.ZARINPAL_SANDBOX else "0") == "1"
+    zp = ZarinPalClient(merchant, is_sandbox=sandbox)
+
+    if not zp.is_configured():
+        bot.answer_callback_query(call.id, "مرچنت زرین‌پال هنوز توسط مدیریت تنظیم نشده است.", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id, "⏳ در حال اتصال به درگاه زرین‌پال...")
+
+    callback_domain = get_gateway_callback_domain()
+    callback_port = db.get_setting("gateway_callback_port", str(config.GATEWAY_CALLBACK_PORT))
+    callback_url = f"http://{callback_domain}:{callback_port}/callback/zarinpal?order_id={order_id}"
+
+    ok, pay_url, authority = zp.request_payment(
+        amount_tomans=order["final_price"],
+        description=f"خرید اشتراک دلتا فورس - {order['plan_name']}",
+        callback_url=callback_url
+    )
+
+    if not ok:
+        bot.send_message(user_id, f"❌ خطا در اتصال به زرین‌پال:\n{authority}", reply_markup=kb.card_payment_keyboard(order_id))
+        return
+
+    db.update_order_gateway_track(order_id, "zarinpal", authority)
+
+    text = (
+        "🟡 <b>درگاه پرداخت اینترنتی زرین‌پال (شاپرک)</b>\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        f"📋 <b>شناسه سفارش:</b> <code>{order_id}</code>\n"
+        f"💵 <b>مبلغ قابل پرداخت:</b> <code>{order['final_price']:,}</code> تومان\n"
+        f"🔑 <b>شناسه تراکنش:</b> <code>{authority}</code>\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        "۱. روی دکمه <b>«ورود به صفحه پرداخت شاپرک»</b> کلیک کرده و پرداخت را تکمیل فرمایید.\n"
+        "۲. پس از پرداخت، به ربات برگشته و روی <b>«استعلام و تایید پرداخت»</b> بزنید تا سرویس شما آنی صادر گردد."
+    )
+    markup = kb.payment_action_keyboard(order_id, pay_url)
+    bot.edit_message_text(text, user_id, call.message.message_id, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("gw_zibal_"))
+def handle_gw_zibal(call):
+    user_id = call.from_user.id
+    order_id = call.data.replace("gw_zibal_", "")
+    order = db.get_order(order_id)
+    if not order:
+        bot.answer_callback_query(call.id, "سفارش یافت نشد!")
+        return
+
+    merchant = db.get_setting("zibal_merchant", config.ZIBAL_MERCHANT or "zibal")
+    zb = ZibalClient(merchant)
+
+    if not zb.is_configured():
+        bot.answer_callback_query(call.id, "مرچنت زیبال هنوز توسط مدیریت تنظیم نشده است.", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id, "⏳ در حال اتصال به درگاه زیبال...")
+
+    callback_domain = get_gateway_callback_domain()
+    callback_port = db.get_setting("gateway_callback_port", str(config.GATEWAY_CALLBACK_PORT))
+    callback_url = f"http://{callback_domain}:{callback_port}/callback/zibal?order_id={order_id}"
+
+    ok, pay_url, track_id = zb.request_payment(
+        amount_tomans=order["final_price"],
+        description=f"خرید اشتراک دلتا فورس - {order['plan_name']}",
+        callback_url=callback_url,
+        order_id=order_id
+    )
+
+    if not ok:
+        bot.send_message(user_id, f"❌ خطا در اتصال به زیبال:\n{track_id}", reply_markup=kb.card_payment_keyboard(order_id))
+        return
+
+    db.update_order_gateway_track(order_id, "zibal", track_id)
+
+    text = (
+        "🔵 <b>درگاه پرداخت اینترنتی زیبال (شاپرک)</b>\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        f"📋 <b>شناسه سفارش:</b> <code>{order_id}</code>\n"
+        f"💵 <b>مبلغ قابل پرداخت:</b> <code>{order['final_price']:,}</code> تومان\n"
+        f"🔑 <b>کد رهگیری تراکنش:</b> <code>{track_id}</code>\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        "۱. روی دکمه <b>«ورود به صفحه پرداخت شاپرک»</b> کلیک کرده و پرداخت را تکمیل فرمایید.\n"
+        "۲. پس از پرداخت، به ربات برگشته و روی <b>«استعلام و تایید پرداخت»</b> بزنید تا سرویس شما آنی صادر گردد."
+    )
+    markup = kb.payment_action_keyboard(order_id, pay_url)
+    bot.edit_message_text(text, user_id, call.message.message_id, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("verify_gw_"))
+def handle_verify_gateway(call):
+    user_id = call.from_user.id
+    order_id = call.data.replace("verify_gw_", "")
+    order = db.get_order(order_id)
+    if not order:
+        bot.answer_callback_query(call.id, "سفارش یافت نشد!")
+        return
+
+    if order["status"] == "completed":
+        bot.answer_callback_query(call.id, "این سفارش قبلاً تایید و صادر شده است.", show_alert=True)
+        return
+
+    track_id = order.get("track_id")
+    if not track_id:
+        bot.answer_callback_query(call.id, "هنوز شناسه پرداختی برای این سفارش ثبت نشده است.", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id, "⏳ در حال استعلام وضعیت پرداخت از بانک...")
+
+    method = order.get("payment_method")
+    verified = False
+    ref_id = None
+    err = ""
+
+    if method == "zarinpal":
+        merchant = db.get_setting("zarinpal_merchant", config.ZARINPAL_MERCHANT)
+        sandbox = db.get_setting("zarinpal_sandbox", "1" if config.ZARINPAL_SANDBOX else "0") == "1"
+        zp = ZarinPalClient(merchant, is_sandbox=sandbox)
+        verified, ref_id, err = zp.verify_payment(track_id, order["final_price"])
+
+    elif method == "zibal":
+        merchant = db.get_setting("zibal_merchant", config.ZIBAL_MERCHANT or "zibal")
+        zb = ZibalClient(merchant)
+        verified, ref_id, err = zb.verify_payment(track_id)
+
+    else:
+        bot.send_message(user_id, "روش پرداخت نامعتبر است.")
+        return
+
+    if verified:
+        fulfill_order(order_id, payment_ref_id=ref_id)
+        try:
+            bot.delete_message(user_id, call.message.message_id)
+        except Exception:
+            pass
+    else:
+        bot.send_message(user_id, f"⚠️ <b>پرداخت تایید نشد:</b>\n{err}\n\n💡 چنانچه مبلغ از حسابتان کسر شده است، ظرف حداکثر ۷۲ ساعت توسط شاپرک برگشت داده می‌شود.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("back_to_order_"))
 def handle_back_order(call):
@@ -711,97 +1007,16 @@ def handle_admin_approve(call):
         bot.answer_callback_query(call.id, "این سفارش قبلاً تایید و صادر شده است.")
         return
 
-    # Check if this order is a renewal
-    is_renewal = str(order.get("plan_name", "")).startswith("تمدید") or (order.get("custom_name") and str(order.get("custom_name")).startswith("renew:"))
-    target_uuid = order.get("hiddify_uuid")
-    if not target_uuid and order.get("custom_name") and str(order.get("custom_name")).startswith("renew:"):
-        target_uuid = str(order.get("custom_name")).replace("renew:", "").strip()
-
-    if is_renewal and target_uuid:
-        ok, result = hiddify.add_traffic_and_days(target_uuid, add_gb=order["traffic_gb"], add_days=order["days"])
-        if not ok:
-            bot.send_message(config.ADMIN_ID, f"❌ خطا در تمدید کاربر در هیدیفای:\n{result}")
-            bot.answer_callback_query(call.id, "خطا در تمدید هیدیفای!")
-            return
-        user_uuid = target_uuid
-        client_name = order.get("custom_name") or "اشتراک تمدید شده"
-        sub_url = hiddify.get_sub_url(user_uuid)
-    else:
-        client_name = order.get("custom_name") or f"df-{order['tg_id'] % 10000}-{int(time.time()) % 1000}"
-        ok, result = hiddify.create_user(
-            name=client_name,
-            usage_limit_gb=order["traffic_gb"],
-            package_days=order["days"],
-            telegram_id=order["tg_id"],
-            comment=f"Order {order_id}"
+    ok, user_uuid, is_renewal = fulfill_order(order_id, payment_ref_id="CardApproval")
+    if ok:
+        bot.edit_message_caption(
+            f"✅ <b>سفارش {order_id} با موفقیت تایید شد.</b>\nاشتراک با شناسه <code>{user_uuid}</code> {'تمدید' if is_renewal else 'صادر'} و برای مشتری ارسال گردید.",
+            config.ADMIN_ID,
+            call.message.message_id
         )
-        if not ok:
-            bot.send_message(config.ADMIN_ID, f"❌ خطا در صدور کاربر در هیدیفای:\n{result}")
-            bot.answer_callback_query(call.id, "خطا در اتصال به هیدیفای!")
-            return
-        user_uuid = result.get("uuid")
-        sub_url = result.get("sub_url")
-
-    db.update_order_status(order_id, "completed", hiddify_uuid=user_uuid)
-    db.add_user_subscription(order["tg_id"], user_uuid, client_name, order["traffic_gb"], order["days"])
-
-    # Process 10% referral reward for the inviter
-    buyer = db.get_user(order["tg_id"])
-    if buyer and buyer.get("invited_by"):
-        inviter_id = buyer["invited_by"]
-        reward = int(order["final_price"] * 0.10)
-        if reward > 0:
-            db.add_wallet_balance(inviter_id, reward)
-            db.record_referral_reward(inviter_id, order["tg_id"], order_id, order["final_price"], reward)
-            inviter = db.get_user(inviter_id)
-            new_balance = inviter["wallet_balance"] if inviter else reward
-            try:
-                bot.send_message(
-                    inviter_id,
-                    f"🎁 <b>پاداش دعوت جدید واریز شد!</b>\n"
-                    f"➖➖➖➖➖➖➖➖➖➖\n"
-                    f"یکی از دوستان دعوت‌شده شما اشتراک خریداری کرد و <b>۱۰٪ از مبلغ سفارش</b> به کیف پول شما اضافه شد:\n\n"
-                    f"💰 <b>مبلغ پاداش:</b> <code>+{reward:,} تومان</code>\n"
-                    f"💳 <b>موجودی جدید کیف پول:</b> <code>{new_balance:,} تومان</code>\n\n"
-                    f"💡 <i>می‌توانید از این موجودی برای خرید اشتراک‌های پرسرعت دلتا فورس نت استفاده کنید.</i>"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to notify inviter {inviter_id}: {e}")
-
-    bot.edit_message_caption(
-        f"✅ <b>سفارش {order_id} با موفقیت تایید شد.</b>\nاشتراک با شناسه <code>{user_uuid}</code> {'تمدید' if is_renewal else 'صادر'} و برای مشتری ارسال گردید.",
-        config.ADMIN_ID,
-        call.message.message_id
-    )
-    bot.answer_callback_query(call.id, "تایید شد و سرویس تحویل گردید!")
-
-    delivery_msg = (
-        "🎉 <b>تبریک! پرداخت شما تایید و اشتراک تمدید شد</b>\n"
-        "➖➖➖➖➖➖➖➖➖➖\n"
-        f"📦 <b>پلن:</b> {order['plan_name']}\n"
-        f"📊 <b>حجم افزوده شده:</b> {order['traffic_gb']} گیگابایت\n"
-        f"⏳ <b>اعتبار افزوده شده:</b> {order['days']} روز\n"
-        "➖➖➖➖➖➖➖➖➖➖\n"
-        f"🔗 <b>لینک هوشمند سابسکریپشن شما:</b>\n"
-        f"<code>{sub_url}</code>\n\n"
-        "💡 <i>حجم و زمان به اشتراک قبلی شما اضافه شد و نیازی به تغییر یا تعویض کانفیگ ندارید.</i>"
-    ) if is_renewal else (
-        "🎉 <b>تبریک! پرداخت شما تایید و اشتراک صادر شد</b>\n"
-        "➖➖➖➖➖➖➖➖➖➖\n"
-        f"📦 <b>پلن:</b> {order['plan_name']}\n"
-        f"📊 <b>حجم:</b> {order['traffic_gb']} گیگابایت\n"
-        f"⏳ <b>اعتبار:</b> {order['days']} روز\n"
-        "➖➖➖➖➖➖➖➖➖➖\n"
-        f"🔗 <b>لینک هوشمند سابسکریپشن شما:</b>\n"
-        f"<code>{sub_url}</code>\n\n"
-        "💡 <b>نحوه اتصال:</b>\n"
-        "کافیست لینک بالا را کپی کرده و در برنامه متناسب با سیستم‌عامل خود (V2rayNG, Streisand, v2rayN, Hiddify) در بخش Import از کلیپ‌بورد وارد نمایید."
-    )
-    markup = kb.sub_details_keyboard(sub_url, user_uuid=user_uuid)
-    try:
-        bot.send_message(order["tg_id"], delivery_msg, reply_markup=markup)
-    except Exception as e:
-        logger.error(f"Failed to deliver to user {order['tg_id']}: {e}")
+        bot.answer_callback_query(call.id, "تایید شد و سرویس تحویل گردید!")
+    else:
+        bot.answer_callback_query(call.id, f"خطا در صدور: {user_uuid}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("adm_rej_"))
 def handle_admin_reject(call):
@@ -1978,6 +2193,125 @@ def handle_cb_open_admin(call):
     show_admin_panel(call.from_user.id)
     bot.answer_callback_query(call.id)
 
+# ----------------- Admin Gateway Handlers -----------------
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_gateways")
+def handle_adm_gateways(call):
+    if call.from_user.id != config.ADMIN_ID:
+        return
+    show_admin_gateways(call.from_user.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+def show_admin_gateways(user_id, message_id=None):
+    zp_merchant = db.get_setting("zarinpal_merchant", config.ZARINPAL_MERCHANT)
+    zp_on = db.get_setting("zarinpal_active", "1" if zp_merchant else "0") == "1"
+    zp_sandbox = db.get_setting("zarinpal_sandbox", "1" if config.ZARINPAL_SANDBOX else "0") == "1"
+
+    zb_merchant = db.get_setting("zibal_merchant", config.ZIBAL_MERCHANT)
+    zb_on = db.get_setting("zibal_active", "1" if zb_merchant else "0") == "1"
+
+    port = db.get_setting("gateway_callback_port", str(config.GATEWAY_CALLBACK_PORT))
+    domain = get_gateway_callback_domain()
+
+    text = (
+        "💳 <b>مدیریت درگاه‌های پرداخت آنلاین (زرین‌پال و زیبال)</b>\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        f"🟡 <b>درگاه زرین‌پال:</b>\n"
+        f"🔑 مرچنت کد: <code>{zp_merchant or 'تنظیم نشده (خالی)'}</code>\n"
+        f"📌 وضعیت: {'🟢 فعال' if zp_on else '🔴 غیرفعال'}\n"
+        f"🧪 حالت: {'🟡 سندباکس تستی' if zp_sandbox else '🟢 درگاه واقعی (لایو)'}\n\n"
+        f"🔵 <b>درگاه زیبال:</b>\n"
+        f"🔑 مرچنت کد: <code>{zb_merchant or 'تنظیم نشده (پیش‌فرض zibal)'}</code>\n"
+        f"📌 وضعیت: {'🟢 فعال' if zb_on else '🔴 غیرفعال'}\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        f"🌐 دامنه کالبک: <code>{domain}</code> (پورت: <code>{port}</code>)\n"
+        "💡 <i>جهت فعال‌سازی هر درگاه، روی دکمه تنظیم مرچنت کلیک فرمایید.</i>"
+    )
+    markup = kb.admin_gateways_keyboard(zp_on, zb_on, zp_sandbox)
+    if message_id:
+        try:
+            bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
+            return
+        except Exception:
+            pass
+    bot.send_message(user_id, text, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_tog_zarinpal")
+def handle_tog_zarinpal(call):
+    if call.from_user.id != config.ADMIN_ID:
+        return
+    curr = db.get_setting("zarinpal_active", "0")
+    new_val = "0" if curr == "1" else "1"
+    db.set_setting("zarinpal_active", new_val)
+    show_admin_gateways(call.from_user.id, call.message.message_id)
+    bot.answer_callback_query(call.id, f"زرین‌پال {'فعال' if new_val == '1' else 'غیرفعال'} شد.")
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_tog_zibal")
+def handle_tog_zibal(call):
+    if call.from_user.id != config.ADMIN_ID:
+        return
+    curr = db.get_setting("zibal_active", "0")
+    new_val = "0" if curr == "1" else "1"
+    db.set_setting("zibal_active", new_val)
+    show_admin_gateways(call.from_user.id, call.message.message_id)
+    bot.answer_callback_query(call.id, f"زیبال {'فعال' if new_val == '1' else 'غیرفعال'} شد.")
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_tog_zpsandbox")
+def handle_tog_zpsandbox(call):
+    if call.from_user.id != config.ADMIN_ID:
+        return
+    curr = db.get_setting("zarinpal_sandbox", "0")
+    new_val = "0" if curr == "1" else "1"
+    db.set_setting("zarinpal_sandbox", new_val)
+    show_admin_gateways(call.from_user.id, call.message.message_id)
+    bot.answer_callback_query(call.id, f"حالت تست زرین‌پال {'فعال' if new_val == '1' else 'غیرفعال'} شد.")
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_set_zarinpal")
+def handle_ask_zarinpal(call):
+    if call.from_user.id != config.ADMIN_ID:
+        return
+    set_state(config.ADMIN_ID, "ADMIN_SET_ZARINPAL")
+    text = (
+        "🟡 <b>تنظیم مرچنت کد زرین‌پال</b>\n\n"
+        "لطفاً <b>Merchant ID</b> (کد ۳۶ کاراکتری درگاه) دریافتی از پنل زرین‌پال را ارسال فرمایید:\n"
+        "مثال: <code>xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</code>"
+    )
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("❌ انصراف", callback_data="adm_gateways"))
+    bot.edit_message_text(text, call.from_user.id, call.message.message_id, reply_markup=markup)
+    bot.answer_callback_query(call.id)
+
+def process_admin_set_zarinpal(message):
+    merchant = message.text.strip()
+    clear_state(config.ADMIN_ID)
+    db.set_setting("zarinpal_merchant", merchant)
+    db.set_setting("zarinpal_active", "1")
+    bot.reply_to(message, f"✅ مرچنت کد زرین‌پال روی <code>{merchant}</code> ذخیره و درگاه فعال شد.")
+    show_admin_gateways(message.chat.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_set_zibal")
+def handle_ask_zibal(call):
+    if call.from_user.id != config.ADMIN_ID:
+        return
+    set_state(config.ADMIN_ID, "ADMIN_SET_ZIBAL")
+    text = (
+        "🔵 <b>تنظیم مرچنت کد زیبال</b>\n\n"
+        "لطفاً <b>Merchant</b> اختصاصی خود از پنل زیبال را ارسال فرمایید:\n"
+        "<i>(برای حالت تستی زیبال، کلمه <code>zibal</code> را ارسال کنید)</i>"
+    )
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("❌ انصراف", callback_data="adm_gateways"))
+    bot.edit_message_text(text, call.from_user.id, call.message.message_id, reply_markup=markup)
+    bot.answer_callback_query(call.id)
+
+def process_admin_set_zibal(message):
+    merchant = message.text.strip()
+    clear_state(config.ADMIN_ID)
+    db.set_setting("zibal_merchant", merchant)
+    db.set_setting("zibal_active", "1")
+    bot.reply_to(message, f"✅ مرچنت کد زیبال روی <code>{merchant}</code> ذخیره و درگاه فعال شد.")
+    show_admin_gateways(message.chat.id)
+
 @bot.callback_query_handler(func=lambda call: call.data == "adm_server_status")
 def handle_adm_server_status(call):
     if call.from_user.id != config.ADMIN_ID:
@@ -2494,10 +2828,148 @@ def handle_cb_back_main(call):
     bot.send_message(user_id, "منوی اصلی:", reply_markup=kb.main_menu(user_id))
     bot.answer_callback_query(call.id)
 
+# ----------------- Gateway Callback HTTP Server -----------------
+
+class GatewayCallbackHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
+
+        order_id = query.get("order_id", [""])[0]
+
+        if path.startswith("/callback/zarinpal"):
+            authority = query.get("Authority", [""])[0]
+            status = query.get("Status", [""])[0]
+
+            if not order_id and authority:
+                ord_row = db.get_order_by_track_id(authority)
+                if ord_row:
+                    order_id = ord_row["order_id"]
+
+            if status == "OK" and order_id:
+                order = db.get_order(order_id)
+                if order:
+                    if order["status"] == "completed":
+                        self.render_html("success", ref_id=order.get("ref_id", "قبلاً تایید شده"))
+                        return
+
+                    merchant = db.get_setting("zarinpal_merchant", config.ZARINPAL_MERCHANT)
+                    sandbox = db.get_setting("zarinpal_sandbox", "1" if config.ZARINPAL_SANDBOX else "0") == "1"
+                    zp = ZarinPalClient(merchant, is_sandbox=sandbox)
+                    ok, ref_id, err = zp.verify_payment(authority or order.get("track_id"), order["final_price"])
+                    if ok:
+                        fulfill_order(order_id, payment_ref_id=ref_id)
+                        self.render_html("success", ref_id=ref_id)
+                        return
+                    else:
+                        self.render_html("fail", error_msg=err)
+                        return
+            self.render_html("fail", error_msg="پرداخت انجام نشد یا توسط کاربر لغو گردید.")
+
+        elif path.startswith("/callback/zibal"):
+            track_id = query.get("trackId", [""])[0]
+            success = query.get("success", [""])[0]
+
+            if not order_id and track_id:
+                ord_row = db.get_order_by_track_id(track_id)
+                if ord_row:
+                    order_id = ord_row["order_id"]
+
+            if success in ("1", "2") and order_id:
+                order = db.get_order(order_id)
+                if order:
+                    if order["status"] == "completed":
+                        self.render_html("success", ref_id=order.get("ref_id", "قبلاً تایید شده"))
+                        return
+
+                    merchant = db.get_setting("zibal_merchant", config.ZIBAL_MERCHANT or "zibal")
+                    zb = ZibalClient(merchant)
+                    ok, ref_id, err = zb.verify_payment(track_id or order.get("track_id"))
+                    if ok:
+                        fulfill_order(order_id, payment_ref_id=ref_id)
+                        self.render_html("success", ref_id=ref_id)
+                        return
+                    else:
+                        self.render_html("fail", error_msg=err)
+                        return
+            self.render_html("fail", error_msg="پرداخت انجام نشد یا توسط کاربر لغو گردید.")
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"404 Not Found")
+
+    def render_html(self, status, ref_id="", error_msg=""):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        bot_user = config.CHANNEL_USERNAME.replace("@", "")
+
+        if status == "success":
+            html = f"""<!DOCTYPE html>
+<html dir="rtl" lang="fa">
+<head><meta charset="utf-8"><title>پرداخت موفق</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ background:#0f172a; color:#f8fafc; font-family:tahoma,sans-serif; text-align:center; padding:40px 15px; margin:0; }}
+.card {{ background:#1e293b; max-width:420px; margin:0 auto; padding:30px 20px; border-radius:18px; border:1px solid #334155; box-shadow:0 10px 25px rgba(0,0,0,0.5); }}
+.badge {{ font-size:50px; margin-bottom:10px; }}
+h2 {{ color:#22c55e; margin:0 0 15px; font-size:22px; }}
+p {{ font-size:14px; line-height:1.7; color:#94a3b8; margin:8px 0; }}
+.ref {{ background:#0f172a; padding:10px 15px; border-radius:8px; font-family:monospace; font-size:16px; color:#38bdf8; display:inline-block; margin:15px 0; }}
+.btn {{ background:#3b82f6; color:#fff; display:block; padding:12px; border-radius:10px; text-decoration:none; font-weight:bold; margin-top:20px; }}
+</style></head>
+<body>
+<div class="card">
+  <div class="badge">🎉</div>
+  <h2>پرداخت شما با موفقیت تایید شد!</h2>
+  <p>اشتراک پرسرعت شما بلافاصله صادر گردید و در تلگرام ارسال شد.</p>
+  <div class="ref">کد پیگیری: {ref_id}</div>
+  <a class="btn" href="https://t.me/{bot_user}">بازگشت به ربات تلگرام</a>
+</div>
+</body></html>"""
+        else:
+            html = f"""<!DOCTYPE html>
+<html dir="rtl" lang="fa">
+<head><meta charset="utf-8"><title>پرداخت ناموفق</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ background:#0f172a; color:#f8fafc; font-family:tahoma,sans-serif; text-align:center; padding:40px 15px; margin:0; }}
+.card {{ background:#1e293b; max-width:420px; margin:0 auto; padding:30px 20px; border-radius:18px; border:1px solid #334155; }}
+.badge {{ font-size:50px; margin-bottom:10px; }}
+h2 {{ color:#ef4444; margin:0 0 15px; font-size:22px; }}
+p {{ font-size:14px; line-height:1.7; color:#94a3b8; }}
+.btn {{ background:#475569; color:#fff; display:block; padding:12px; border-radius:10px; text-decoration:none; font-weight:bold; margin-top:20px; }}
+</style></head>
+<body>
+<div class="card">
+  <div class="badge">❌</div>
+  <h2>پرداخت ناموفق یا لغو شده</h2>
+  <p>{error_msg or 'تراکنش توسط بانک تایید نشد.'}</p>
+  <a class="btn" href="https://t.me/{bot_user}">بازگشت به ربات</a>
+</div>
+</body></html>"""
+        self.wfile.write(html.encode("utf-8"))
+
+    def log_message(self, format, *args):
+        pass
+
+def start_callback_server():
+    port = int(db.get_setting("gateway_callback_port", config.GATEWAY_CALLBACK_PORT))
+    try:
+        server = HTTPServer(("0.0.0.0", port), GatewayCallbackHandler)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        logger.info(f"Payment gateway callback HTTP server running on port {port}")
+    except Exception as e:
+        logger.warning(f"Could not bind payment callback server to port {port}: {e}")
+
 # ----------------- Main Entrypoint -----------------
 
 if __name__ == "__main__":
     logger.info("Delta Force Shop Bot starting...")
+    start_callback_server()
     try:
         bot.remove_webhook()
     except Exception:

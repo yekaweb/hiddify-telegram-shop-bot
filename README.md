@@ -1,24 +1,74 @@
 # Hiddify Telegram Shop & Reseller Bot
 
-A Telegram bot designed for Hiddify panels with automated account generation, reseller management, and real-time subscription diagnostics.
+ربات فروشگاهی و سیستم نمایندگی اختصاصی برای پنل **Hiddify Manager** با اتصال مستقیم به درگاه‌های پرداخت آنلاین **زرین‌پال (ZarinPal)** و **زیبال (Zibal)** شبکه شاپرک، سیستم جامع استعلام آنلاین اشتراک، و پچر خودکار ضدآپدیت.
 
-## Features
-- **Automated Sales & Wallet**: Users can browse packages, pay via card-to-card, and receive instant subscriptions.
-- **Reseller System**: Delegated reseller accounts with allocated volume (GB) and expiration limits.
-- **Diagnostics**: Users can send subscription URLs or UUIDs to view real-time traffic usage, online/offline status, and expiration dates.
-- **Dynamic Config**: Automatically reads panel credentials from local files on the server with zero hardcoded secrets.
+---
 
-## Installation
-Run the following script on your server as root:
+## قابلیت‌های شاخص (Key Features)
+
+### ۱. اتصال به درگاه‌های پرداخت آنلاین شاپرک (زرین‌پال و زیبال)
+- **پشتیبانی رسمی از API زرین‌پال (REST v4):** قابلیت کارکرد در دو حالت درگاه اصلی و سندباکس تستی (Sandbox).
+- **پشتیبانی رسمی از API زیبال (v1):** ایجاد آنی تراکنش و رهگیری پرداخت با TrackId.
+- **تایید دوگانه هوشمند (Dual-Verification):**
+  - **کالبک وب سرور داخلی:** پردازش خودکار تراکنش پس از بازگشت کاربر از درگاه و نمایش رسید تراکنش در مرورگر.
+  - **استعلام مستقیم درون تلگرام:** دکمه «استعلام و تایید پرداخت» داخل بات جهت جلوگیری از خطا در صورت بسته شدن مرورگر.
+- **تحویل آنی اکانت:** به محض تایید پرداخت، اشتراک هیدیفای ساخته شده و لینک سابسکریپشن به خریدار تحویل داده می‌شود.
+- **تنظیمات کامل از پنل مدیریت:** تعیین مرچنت کدها و فعال/غیرفعال‌سازی درگاه‌ها مستقیماً از داخل ربات.
+
+### ۲. سیستم نمایندگی و همکاران فروش (Reseller Panel)
+- امکان تعریف همکار با سهمیه حجم مشخص (گیگابایت) و تاریخ انقضا.
+- لاگین اختصاصی همکار در ربات و صدور مستقل کانفیگ با کسر خودکار از سهمیه.
+- ثبت تگ همکار در پنل هیدیفای (`[Reseller: name] - Client: user`).
+- امکان تمدید و افزایش حجم اشتراک‌های قبلی مشتریان همکار.
+
+### ۳. استعلام و عیب‌یابی آنلاین اشتراک
+- ارسال لینک سابسکریپشن، کانفیگ مستقیم (`vless`, `vmess`, `trojan`) یا UUID توسط کاربر.
+- نمایش وضعیت آنلاین/آفلاین، حجم مصرفی، باقی‌مانده، درصد مصرف بصری و تاریخ انقضای شمسی.
+
+### ۴. امنیت کامل و بدون درز اطلاعات (Zero-Leak)
+- هیچ آدرس سرور، پورت یا کلید API هیدیفای در کد ذخیره نمی‌شود.
+- ربات تنظیمات سرور را به صورت خودکار از فایل محلی `current.json` هیدیفای دریافت می‌کند.
+
+---
+
+## نصب سریع (1-Click Install)
+
+روی سرور لینوکس دارای هیدیفای، دستور زیر را اجرا فرمایید:
+
 ```bash
 bash <(curl -sL https://raw.githubusercontent.com/yekaweb/hiddify-telegram-shop-bot/main/install.sh)
 ```
 
-## Maintenance
-To refresh configuration or restore the service after panel updates:
+یا همراه با ارسال مستقیم مشخصات:
+
+```bash
+bash <(curl -sL https://raw.githubusercontent.com/yekaweb/hiddify-telegram-shop-bot/main/install.sh) --token "BOT_TOKEN" --admin "ADMIN_ID"
+```
+
+---
+
+## پچ خودکار پس از آپدیت هیدیفای
+
+جهت همگام‌سازی مجدد تنظیمات و آزادسازی وب‌هوک پس از آپدیت پنل:
+
 ```bash
 bash /opt/deltaforce-shop/patch.sh
 ```
 
-## License
-MIT
+---
+
+## متغیرهای پیکربندی (.env)
+
+```env
+BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
+ADMIN_ID=123456789
+
+# درگاه‌های پرداخت (اختیاری - از منوی ادمین نیز قابل تنظیم است)
+ZARINPAL_MERCHANT=
+ZARINPAL_SANDBOX=0
+ZIBAL_MERCHANT=zibal
+GATEWAY_CALLBACK_PORT=8088
+```
+
+## لایسنس
+MIT License

@@ -67,12 +67,22 @@ def referral_keyboard(user_id: int):
     markup.add(types.InlineKeyboardButton("💳 مشاهده موجودی کیف پول", callback_data="open_wallet_section"))
     return markup
 
-def gateways_keyboard(order_id: str):
+def gateways_keyboard(order_id: str, zarinpal_on: bool = True, zibal_on: bool = True):
     markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton("💳 درگاه ریالی تون‌پیز (بزودی)", callback_data=f"gw_tonpees_{order_id}"))
-    markup.add(types.InlineKeyboardButton("💳 درگاه ریالی تون‌یار (بزودی)", callback_data=f"gw_tonyar_{order_id}"))
-    markup.add(types.InlineKeyboardButton("💳 درگاه ریالی ترونادو (بزودی)", callback_data=f"gw_tronado_{order_id}"))
+    if zarinpal_on:
+        markup.add(types.InlineKeyboardButton("🟡 درگاه پرداخت آنلاین زرین‌پال (شاپرک)", callback_data=f"gw_zarinpal_{order_id}"))
+    if zibal_on:
+        markup.add(types.InlineKeyboardButton("🔵 درگاه پرداخت آنلاین زیبال (شاپرک)", callback_data=f"gw_zibal_{order_id}"))
+    if not zarinpal_on and not zibal_on:
+        markup.add(types.InlineKeyboardButton("⚠️ درگاه‌های پرداخت موقتاً غیرفعال هستند", callback_data=f"back_to_order_{order_id}"))
     markup.add(types.InlineKeyboardButton("‹ بازگشت به روش‌های پرداخت", callback_data=f"back_to_order_{order_id}"))
+    return markup
+
+def payment_action_keyboard(order_id: str, payment_url: str):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("💳 ورود به صفحه پرداخت شاپرک", url=payment_url))
+    markup.add(types.InlineKeyboardButton("🔄 استعلام و تایید پرداخت", callback_data=f"verify_gw_{order_id}"))
+    markup.add(types.InlineKeyboardButton("‹ انصراف و بازگشت", callback_data=f"back_to_order_{order_id}"))
     return markup
 
 def card_payment_keyboard(order_id: str):
@@ -173,11 +183,36 @@ def admin_panel_keyboard(admin_url: str):
         types.InlineKeyboardButton("📑 فیش‌های منتظر تایید", callback_data="adm_pending_receipts")
     )
     markup.add(
-        types.InlineKeyboardButton("📢 پیام همگانی", callback_data="adm_broadcast"),
+        types.InlineKeyboardButton("💳 درگاه‌های پرداخت (زرین‌پال / زیبال)", callback_data="adm_gateways"),
+        types.InlineKeyboardButton("📢 پیام همگانی", callback_data="adm_broadcast")
+    )
+    markup.add(
         types.InlineKeyboardButton("🖥 ورود به پنل وب هیدیفای", url=admin_url)
     )
     markup.add(
         types.InlineKeyboardButton("‹ بازگشت به منوی کاربری", callback_data="back_to_main")
+    )
+    return markup
+
+def admin_gateways_keyboard(zarinpal_on: bool, zibal_on: bool, is_sandbox: bool):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    zp_status = "🟢 روشن" if zarinpal_on else "🔴 خاموش"
+    zb_status = "🟢 روشن" if zibal_on else "🔴 خاموش"
+    sb_status = "🟡 حالت تستی (Sandbox)" if is_sandbox else "🟢 درگاه واقعی"
+
+    markup.add(
+        types.InlineKeyboardButton("🟡 تنظیم مرچنت زرین‌پال", callback_data="adm_set_zarinpal"),
+        types.InlineKeyboardButton(f"زرین‌پال: {zp_status}", callback_data="adm_tog_zarinpal")
+    )
+    markup.add(
+        types.InlineKeyboardButton("🔵 تنظیم مرچنت زیبال", callback_data="adm_set_zibal"),
+        types.InlineKeyboardButton(f"زیبال: {zb_status}", callback_data="adm_tog_zibal")
+    )
+    markup.add(
+        types.InlineKeyboardButton(f"حالت زرین‌پال: {sb_status}", callback_data="adm_tog_zpsandbox")
+    )
+    markup.add(
+        types.InlineKeyboardButton("‹ بازگشت به مدیریت", callback_data="open_admin_panel")
     )
     return markup
 

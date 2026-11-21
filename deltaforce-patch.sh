@@ -179,6 +179,11 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
+# Ensure Gateway Callback port is open if firewall is active
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+    ufw allow 8088/tcp comment 'Payment Gateway Callback' >/dev/null 2>&1 || true
+fi
+
 systemctl daemon-reload
 systemctl enable deltaforce-shop.service >/dev/null 2>&1
 

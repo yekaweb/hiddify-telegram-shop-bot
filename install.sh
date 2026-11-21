@@ -96,6 +96,10 @@ SUPPORT_BOT_USERNAME=@DeltaForce_supbot
 SUPPORT_BOT_URL=https://t.me/DeltaForce_supbot
 DEFAULT_CARD_NUMBER=6037-0000-0000-0000
 DEFAULT_CARD_HOLDER=مدیریت فروشگاه
+ZARINPAL_MERCHANT=
+ZARINPAL_SANDBOX=0
+ZIBAL_MERCHANT=
+GATEWAY_CALLBACK_PORT=8088
 EOF
     echo "✅ Saved configuration to $ENV_FILE"
 else
@@ -160,6 +164,11 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
+
+# Ensure Gateway Callback port is open if firewall is active
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+    ufw allow 8088/tcp comment 'Payment Gateway Callback' >/dev/null 2>&1 || true
+fi
 
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME" >/dev/null 2>&1

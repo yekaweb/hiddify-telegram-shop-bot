@@ -93,3 +93,10 @@ DEFAULT_PRICE_PER_DAY = int(os.getenv("DEFAULT_PRICE_PER_DAY", "1000"))
 # Default Card Details (Can be edited by admin in-bot)
 DEFAULT_CARD_NUMBER = os.getenv("DEFAULT_CARD_NUMBER", "6037-9970-0000-0000")
 DEFAULT_CARD_HOLDER = os.getenv("DEFAULT_CARD_HOLDER", "دلتا فورس نت")
+
+# Payment Gateways (ZarinPal & Zibal)
+ZARINPAL_MERCHANT = os.getenv("ZARINPAL_MERCHANT", "")
+ZARINPAL_SANDBOX = os.getenv("ZARINPAL_SANDBOX", "0").lower() in ("1", "true", "yes")
+ZIBAL_MERCHANT = os.getenv("ZIBAL_MERCHANT", "")
+GATEWAY_CALLBACK_PORT = int(os.getenv("GATEWAY_CALLBACK_PORT", "8088"))
+

@@ -69,11 +69,23 @@ def init_db():
             status TEXT DEFAULT 'pending_payment',
             payment_method TEXT DEFAULT 'card',
             receipt_photo_id TEXT DEFAULT NULL,
+            track_id TEXT DEFAULT NULL,
+            ref_id TEXT DEFAULT NULL,
             hiddify_uuid TEXT DEFAULT NULL,
             custom_name TEXT DEFAULT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Dynamic migrations for orders table
+    try:
+        c.execute("ALTER TABLE orders ADD COLUMN track_id TEXT DEFAULT NULL")
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE orders ADD COLUMN ref_id TEXT DEFAULT NULL")
+    except Exception:
+        pass
 
     # Subscriptions Table
     c.execute("""
@@ -385,6 +397,37 @@ def update_order_status(order_id, status, receipt_photo_id=None, hiddify_uuid=No
         c.execute("UPDATE orders SET status = ?, hiddify_uuid = ? WHERE order_id = ?", (status, hiddify_uuid, order_id))
     else:
         c.execute("UPDATE orders SET status = ? WHERE order_id = ?", (status, order_id))
+    conn.commit()
+    conn.close()
+
+def update_order_gateway_track(order_id, payment_method, track_id):
+    """Set the gateway method and payment authority/track_id for an order."""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("UPDATE orders SET payment_method = ?, track_id = ? WHERE order_id = ?",
+              (payment_method, str(track_id), order_id))
+    conn.commit()
+    conn.close()
+
+def get_order_by_track_id(track_id):
+    """Lookup order by payment gateway authority or track_id."""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM orders WHERE track_id = ?", (str(track_id),))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def complete_paid_order(order_id, ref_id, hiddify_uuid=None):
+    """Mark an order as completed with bank payment reference ID."""
+    conn = get_connection()
+    c = conn.cursor()
+    if hiddify_uuid:
+        c.execute("UPDATE orders SET status = 'completed', ref_id = ?, hiddify_uuid = ? WHERE order_id = ?",
+                  (str(ref_id), hiddify_uuid, order_id))
+    else:
+        c.execute("UPDATE orders SET status = 'completed', ref_id = ? WHERE order_id = ?",
+                  (str(ref_id), order_id))
     conn.commit()
     conn.close()
 
