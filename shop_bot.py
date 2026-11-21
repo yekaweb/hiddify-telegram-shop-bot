@@ -301,6 +301,16 @@ def handle_text_menu(message):
 # ----------------- Free Test Account Handler -----------------
 
 def handle_free_test_account(user_id):
+    is_test_on = db.get_setting("is_test_active", "1") == "1"
+    if not is_test_on:
+        bot.send_message(
+            user_id,
+            "⚠️ <b>هم‌اکنون ارائه اکانت تست موقتاً متوقف شده است.</b>\n\n"
+            "جهت کسب اطلاعات بیشتر یا خرید اشتراک‌های پرسرعت، از منوی ربات استفاده فرمایید یا با پشتیبانی در ارتباط باشید:\n"
+            f"{config.SUPPORT_BOT_USERNAME}"
+        )
+        return
+
     existing = db.get_user_test_account(user_id)
     if existing:
         u_uuid = existing["hiddify_uuid"]
@@ -380,6 +390,18 @@ def handle_free_test_account(user_id):
 # ----------------- Plans & Ordering -----------------
 
 def show_plans(user_id):
+    is_shop_on = db.get_setting("is_shop_active", "1") == "1"
+    if not is_shop_on:
+        bot.send_message(
+            user_id,
+            "⏸ <b>کاربر گرامی، در حال حاضر فرآیند فروش و ثبت سفارش جدید موقتاً متوقف شده است.</b>\n"
+            "➖➖➖➖➖➖➖➖➖➖\n"
+            "علت: ارتقای دوره‌ای سرورها یا تکمیل ظرفیت زیرساخت شبکه.\n\n"
+            "💡 <i>به محض بازگشایی مجدد فروشگاه، از طریق همین ربات و کانال اطلاع‌رسانی خواهد شد.</i>\n\n"
+            f"ارتباط با پشتیبانی: {config.SUPPORT_BOT_USERNAME}"
+        )
+        return
+
     plans = db.get_active_plans()
     text = (
         "💎 <b>لیست پلن‌های پرسرعت دلتا فورس نت</b>\n"
@@ -396,6 +418,11 @@ def show_plans(user_id):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_plan_"))
 def handle_select_plan(call):
     user_id = call.from_user.id
+    is_shop_on = db.get_setting("is_shop_active", "1") == "1"
+    if not is_shop_on:
+        bot.answer_callback_query(call.id, "فروش اشتراک موقتاً متوقف شده است.", show_alert=True)
+        return
+
     plan_id = int(call.data.replace("buy_plan_", ""))
     plan = db.get_plan(plan_id)
     if not plan:
@@ -464,6 +491,11 @@ def send_order_invoice(user_id, order_id, edit_message_id=None):
 @bot.callback_query_handler(func=lambda call: call.data == "buy_custom_plan")
 def handle_custom_plan(call):
     user_id = call.from_user.id
+    is_shop_on = db.get_setting("is_shop_active", "1") == "1"
+    if not is_shop_on:
+        bot.answer_callback_query(call.id, "فروش اشتراک موقتاً متوقف شده است.", show_alert=True)
+        return
+
     min_gb = db.get_setting("min_custom_gb", "5")
     max_gb = db.get_setting("max_custom_gb", "300")
     rate_gb = int(db.get_setting("price_per_gb", "6000"))
@@ -2176,22 +2208,62 @@ def process_reseller_renew_gb(message):
 
 # ----------------- Comprehensive Admin Panel -----------------
 
-def show_admin_panel(user_id):
+def show_admin_panel(user_id, message_id=None):
+    is_shop_active = db.get_setting("is_shop_active", "1") == "1"
+    is_test_active = db.get_setting("is_test_active", "1") == "1"
+
+    shop_status_txt = "🟢 فعال و در حال پذیرش سفارش" if is_shop_active else "🔴 متوقف و مسدود"
+    test_status_txt = "🟢 فعال و در حال ارائه اکانت" if is_test_active else "🔴 متوقف و غیرفعال"
+
     text = (
         "👑 <b>پنل مدیریت ارشد دلتا فورس نت & هیدیفای</b>\n"
         "➖➖➖➖➖➖➖➖➖➖\n"
-        "این پنل به صورت مستقیم به هسته هیدیفای و دیتابیس متصل است.\n"
+        f"🛍 <b>وضعیت سیستم فروش:</b> {shop_status_txt}\n"
+        f"🎁 <b>وضعیت اکانت تستی:</b> {test_status_txt}\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
         "عملیات مورد نظر را از منوی زیر انتخاب نمایید:"
     )
-    markup = kb.admin_panel_keyboard(hiddify.admin_url)
+    markup = kb.admin_panel_keyboard(
+        admin_url=hiddify.admin_url,
+        is_shop_active=is_shop_active,
+        is_test_active=is_test_active
+    )
+    if message_id:
+        try:
+            bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
+            return
+        except Exception:
+            pass
     bot.send_message(user_id, text, reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data == "open_admin_panel")
 def handle_cb_open_admin(call):
     if call.from_user.id != config.ADMIN_ID:
         return
-    show_admin_panel(call.from_user.id)
+    show_admin_panel(call.from_user.id, call.message.message_id)
     bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_tog_shop")
+def handle_adm_tog_shop(call):
+    if call.from_user.id != config.ADMIN_ID:
+        return
+    curr = db.get_setting("is_shop_active", "1")
+    new_val = "0" if curr == "1" else "1"
+    db.set_setting("is_shop_active", new_val)
+    status_str = "فعال و بازگشایی" if new_val == "1" else "متوقف و مسدود"
+    bot.answer_callback_query(call.id, f"عملیات فروش با موفقیت {status_str} شد.", show_alert=True)
+    show_admin_panel(call.from_user.id, call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "adm_tog_test")
+def handle_adm_tog_test(call):
+    if call.from_user.id != config.ADMIN_ID:
+        return
+    curr = db.get_setting("is_test_active", "1")
+    new_val = "0" if curr == "1" else "1"
+    db.set_setting("is_test_active", new_val)
+    status_str = "فعال" if new_val == "1" else "متوقف"
+    bot.answer_callback_query(call.id, f"ارائه اکانت تستی {status_str} شد.", show_alert=True)
+    show_admin_panel(call.from_user.id, call.message.message_id)
 
 # ----------------- Admin Gateway Handlers -----------------
 
@@ -2739,6 +2811,11 @@ def handle_copy_sub(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("renew_sub_") or call.data == "renew_sub")
 def handle_renew_sub(call):
     user_id = call.from_user.id
+    is_shop_on = db.get_setting("is_shop_active", "1") == "1"
+    if not is_shop_on:
+        bot.answer_callback_query(call.id, "تمدید و خرید اشتراک موقتاً متوقف شده است.", show_alert=True)
+        return
+
     u_uuid = call.data.replace("renew_sub_", "") if call.data.startswith("renew_sub_") else ""
     plans = db.get_active_plans()
 

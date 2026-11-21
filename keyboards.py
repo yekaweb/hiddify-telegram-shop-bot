@@ -164,8 +164,15 @@ def admin_reseller_detail_keyboard(reseller_id: int, is_active: bool):
     markup.add(b_del, b_back)
     return markup
 
-def admin_panel_keyboard(admin_url: str):
+def admin_panel_keyboard(admin_url: str, is_shop_active: bool = True, is_test_active: bool = True):
     markup = types.InlineKeyboardMarkup(row_width=2)
+    shop_btn = "🟢 فروش: فعال" if is_shop_active else "🔴 فروش: متوقف"
+    test_btn = "🟢 تست: فعال" if is_test_active else "🔴 تست: متوقف"
+
+    markup.add(
+        types.InlineKeyboardButton(shop_btn, callback_data="adm_tog_shop"),
+        types.InlineKeyboardButton(test_btn, callback_data="adm_tog_test")
+    )
     markup.add(
         types.InlineKeyboardButton("📊 وضعیت سرورها و نودها", callback_data="adm_server_status"),
         types.InlineKeyboardButton("👥 کاربران و آنلاین‌ها", callback_data="adm_users_list")
