@@ -124,6 +124,41 @@ echo "📦 Verifying Python dependencies..."
 echo "🗄️ Initializing/migrating database..."
 "$PYTHON_BIN" -c "import sys; sys.path.append('$INSTALL_DIR'); import database; database.init_db(); print('Database ready.')"
 
+# 8.5 Neutralize Hiddify's internal bot in MariaDB/MySQL & current.json (prevents webhook hijack)
+if command -v mariadb >/dev/null 2>&1 || command -v mysql >/dev/null 2>&1; then
+    SQL_CLI="mariadb"
+    command -v mariadb >/dev/null 2>&1 || SQL_CLI="mysql"
+    CFG_FILE="/opt/hiddify-manager/data/hiddify-panel/app.cfg"
+    if [ -f "$CFG_FILE" ]; then
+        DB_USER=$(grep -oP "mysql\+mysqldb://\K[^:]+" "$CFG_FILE" 2>/dev/null || echo "hiddifypanel")
+        DB_PASS=$(grep -oP "mysql\+mysqldb://[^:]+:\K[^@]+" "$CFG_FILE" 2>/dev/null || echo "")
+        DB_NAME=$(grep -oP "localhost/\K[^?]+" "$CFG_FILE" 2>/dev/null || echo "hiddifypanel")
+        
+        $SQL_CLI -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
+            UPDATE bool_config SET value=0 WHERE \`key\`='telegram_enable';
+            UPDATE str_config SET value='' WHERE \`key\`='telegram_bot_token';
+        " >/dev/null 2>&1 || true
+        echo "🛡️ Neutralized Hiddify internal bot in MariaDB ($DB_NAME)."
+    fi
+fi
+
+"$PYTHON_BIN" << 'PYEOF'
+import json, os
+for cp in ["/opt/hiddify-manager/data/current.json", "/opt/hiddify-panel/data/current.json", "/opt/hiddify-config/data/current.json"]:
+    if os.path.exists(cp):
+        try:
+            with open(cp, "r", encoding="utf-8") as f:
+                cdata = json.load(f)
+            if cdata.get("telegram_enable") is True or cdata.get("telegram_bot_token") != "":
+                cdata["telegram_enable"] = False
+                cdata["telegram_bot_token"] = ""
+                with open(cp, "w", encoding="utf-8") as f:
+                    json.dump(cdata, f, indent=2)
+                print(f"🛡️ Neutralized Hiddify internal bot in {cp}")
+        except Exception:
+            pass
+PYEOF
+
 # 9. Clear Telegram Webhook
 "$PYTHON_BIN" << 'PYEOF'
 import urllib.request, re, os
@@ -140,7 +175,8 @@ if os.path.exists(env_path):
 if token:
     try:
         url = f"https://api.telegram.org/bot{token}/deleteWebhook?drop_pending_updates=True"
-        urllib.request.urlopen(url, timeout=6)
+        req = urllib.request.Request(url, headers={"User-Agent": "DeltaForceBot/1.0"})
+        urllib.request.urlopen(req, timeout=8)
         print("🧹 Telegram Webhook cleared successfully.")
     except Exception as e:
         print(f"⚠️ Webhook clear notice: {e}")

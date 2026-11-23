@@ -127,7 +127,44 @@ if current_data and os.path.exists(shop_config_path):
         print("🔄 Updated config.py with live Hiddify API credentials and domains.")
     else:
         print("✅ config.py is already synchronized with Hiddify.")
+
+    # Neutralize Hiddify internal bot in current.json to prevent webhook hijacking
+    if current_data:
+        c_changed = False
+        if current_data.get("telegram_enable") is True:
+            current_data["telegram_enable"] = False
+            c_changed = True
+        if current_data.get("telegram_bot_token"):
+            current_data["telegram_bot_token"] = ""
+            c_changed = True
+        if c_changed:
+            for cp in config_paths:
+                if os.path.exists(cp):
+                    try:
+                        with open(cp, "w", encoding="utf-8") as f:
+                            json.dump(current_data, f, indent=2)
+                        print(f"🛡️ Neutralized Hiddify internal bot setting in {cp}")
+                    except Exception:
+                        pass
 PYEOF
+
+# 3.5 Neutralize Hiddify's internal bot in MariaDB/MySQL
+if command -v mariadb >/dev/null 2>&1 || command -v mysql >/dev/null 2>&1; then
+    SQL_CLI="mariadb"
+    command -v mariadb >/dev/null 2>&1 || SQL_CLI="mysql"
+    CFG_FILE="/opt/hiddify-manager/data/hiddify-panel/app.cfg"
+    if [ -f "$CFG_FILE" ]; then
+        DB_USER=$(grep -oP "mysql\+mysqldb://\K[^:]+" "$CFG_FILE" 2>/dev/null || echo "hiddifypanel")
+        DB_PASS=$(grep -oP "mysql\+mysqldb://[^:]+:\K[^@]+" "$CFG_FILE" 2>/dev/null || echo "")
+        DB_NAME=$(grep -oP "localhost/\K[^?]+" "$CFG_FILE" 2>/dev/null || echo "hiddifypanel")
+        
+        $SQL_CLI -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
+            UPDATE bool_config SET value=0 WHERE \`key\`='telegram_enable';
+            UPDATE str_config SET value='' WHERE \`key\`='telegram_bot_token';
+        " >/dev/null 2>&1 || true
+        echo "🛡️ Neutralized Hiddify internal bot in MariaDB ($DB_NAME)."
+    fi
+fi
 
 # 4. Clear Telegram Webhook (Allows daemon to take full polling control instantly)
 "$PYTHON_BIN" << 'PYEOF'
@@ -153,12 +190,14 @@ if not token and os.path.exists(conf_path):
     except Exception:
         pass
 
-try:
-    url = f"https://api.telegram.org/bot{token}/deleteWebhook?drop_pending_updates=True"
-    urllib.request.urlopen(url, timeout=6)
-    print("🧹 Webhook cleared & pending updates flushed.")
-except Exception as e:
-    print(f"⚠️ Webhook clear note: {e}")
+if token:
+    try:
+        url = f"https://api.telegram.org/bot{token}/deleteWebhook?drop_pending_updates=True"
+        req = urllib.request.Request(url, headers={"User-Agent": "DeltaForceBot/1.0"})
+        urllib.request.urlopen(req, timeout=8)
+        print("🧹 Webhook cleared & pending updates flushed.")
+    except Exception as e:
+        print(f"⚠️ Webhook clear note: {e}")
 PYEOF
 
 # 5. Ensure systemd daemon is using the exact detected Python

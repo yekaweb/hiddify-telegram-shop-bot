@@ -1280,6 +1280,10 @@ def cb_open_wallet_section(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "buy_from_wallet")
 def cb_buy_from_wallet(call):
+    is_shop_on = db.get_setting("is_shop_active", "1") == "1"
+    if not is_shop_on:
+        bot.answer_callback_query(call.id, "فروش اشتراک موقتاً متوقف شده است.", show_alert=True)
+        return
     plans = db.get_active_plans()
     markup = kb.plans_keyboard(plans)
     text = (
@@ -3042,19 +3046,57 @@ def start_callback_server():
     except Exception as e:
         logger.warning(f"Could not bind payment callback server to port {port}: {e}")
 
-# ----------------- Main Entrypoint -----------------
-
-if __name__ == "__main__":
-    logger.info("Delta Force Shop Bot starting...")
-    start_callback_server()
+def force_delete_webhook():
+    """Forces deletion of any active Telegram webhook to prevent 409 Conflict."""
+    import urllib.request
+    try:
+        url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/deleteWebhook?drop_pending_updates=True"
+        req = urllib.request.Request(url, headers={"User-Agent": "DeltaForceBot/1.0"})
+        urllib.request.urlopen(req, timeout=8)
+    except Exception as ex:
+        logger.warning(f"force_delete_webhook API notice: {ex}")
     try:
         bot.remove_webhook()
     except Exception:
         pass
 
+def start_webhook_guard():
+    """Background watchdog thread that permanently immunizes bot against Hiddify webhook hijacking."""
+    import urllib.request
+    import json
+
+    def _guard():
+        while True:
+            try:
+                time.sleep(25)
+                url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/getWebhookInfo"
+                req = urllib.request.Request(url, headers={"User-Agent": "DeltaForceBot/1.0"})
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    data = json.loads(resp.read().decode())
+                    if data.get("ok") and data.get("result", {}).get("url"):
+                        logger.warning(f"Third-party/Hiddify webhook detected ({data['result']['url']}), neutralizing immediately...")
+                        force_delete_webhook()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_guard, daemon=True)
+    t.start()
+    logger.info("Webhook guard watchdog active (protects against Hiddify webhook takeover).")
+
+# ----------------- Main Entrypoint -----------------
+
+if __name__ == "__main__":
+    logger.info("Delta Force Shop Bot starting...")
+    start_callback_server()
+    force_delete_webhook()
+    start_webhook_guard()
+
     while True:
         try:
-            bot.infinity_polling(timeout=20, long_polling_timeout=15)
+            force_delete_webhook()
+            bot.infinity_polling(timeout=20, long_polling_timeout=15, skip_pending=True)
         except Exception as e:
-            logger.error(f"Polling crashed: {e}. Retrying in 5 seconds...")
-            time.sleep(5)
+            logger.error(f"Polling crashed: {e}. Retrying in 3 seconds...")
+            if "409" in str(e) or "Conflict" in str(e) or "webhook" in str(e).lower():
+                force_delete_webhook()
+            time.sleep(3)
